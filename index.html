@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>바다환경 E-수거하기 — 2D 프로토타입</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b2a3a;overflow:hidden;
+    font-family:"Apple SD Gothic Neo","Noto Sans KR",system-ui,sans-serif;color:#eaf2f6;}
+  #wrap{position:relative;width:100vw;height:100vh;}
+  canvas{display:block;}
+  #hud{position:absolute;top:12px;left:12px;font-size:15px;line-height:1.5;
+    background:rgba(6,20,28,.55);padding:10px 14px;border-radius:10px;pointer-events:none;}
+  #hud b{color:#7fe3c0;}
+  #help{position:absolute;bottom:12px;left:12px;font-size:13px;opacity:.82;
+    background:rgba(6,20,28,.5);padding:8px 12px;border-radius:10px;line-height:1.6;}
+  #help .k{display:inline-block;min-width:52px;padding:1px 6px;margin:0 2px;
+    background:#1d3f52;border-radius:5px;text-align:center;font-weight:600;}
+  #touch{position:absolute;bottom:0;left:0;right:0;height:34%;display:none;
+    grid-template-columns:1fr 1fr 1fr;gap:6px;padding:8px;box-sizing:border-box;}
+  #touch button{font-size:20px;background:rgba(29,63,82,.85);color:#eaf2f6;
+    border:none;border-radius:12px;}
+  #touch button:active{background:#2d6f8e;}
+  @media (pointer:coarse){#touch{display:grid;}#help{display:none;}}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    🗑️ 수거: <b><span id="count">0</span></b> 개 &nbsp;|&nbsp; 점수: <b><span id="score">0</span></b><br>
+    들고 있는 것: <span id="held">—</span>
+  </div>
+  <div id="help">
+    <span class="k">A</span><span class="k">D</span> 트롤리 이동 &nbsp;
+    <span class="k">W</span><span class="k">S</span> 집게 올림/내림 &nbsp;
+    <span class="k">Space</span> 집기 / 놓기<br>
+    가벼운 EPS는 쉽고, 말통은 묵직하게 흔들리고, 폐어망은 흐물거려서 잘 빠져. 오른쪽 트럭 적재함에 넣으면 수거 완료.
+  </div>
+  <div id="touch">
+    <button data-k="a">◀</button>
+    <button data-k="w">▲</button>
+    <button data-k="d">▶</button>
+    <button data-k="grab" style="grid-column:1 / 2;">집기</button>
+    <button data-k="s">▼</button>
+    <button data-k="spawn">+쓰레기</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+const { Engine, Render, Runner, Bodies, Body, Composite, Constraint, Query, Events } = Matter;
+
+const W = window.innerWidth, H = window.innerHeight;
+const engine = Engine.create();
+engine.gravity.y = 1;
+const world = engine.world;
+
+const render = Render.create({
+  element: document.getElementById('wrap'),
+  engine,
+  options: { width: W, height: H, wireframes: false, background: '#0b2a3a' },
+});
+Render.run(render);
+Runner.run(Runner.create(), engine);
+
+// ---- 바다/부두 ----
+const seaY = H * 0.72;                       // 부두 수면 = 쓰레기가 쉬는 바닥 + 집게 도달선
+const floor = Bodies.rectangle(W/2, seaY + 60, W*2, 120, { isStatic: true, render:{fillStyle:'#083043'} });
+const leftWall  = Bodies.rectangle(-30, H/2, 60, H*2, { isStatic:true, render:{visible:false} });
+const rightWall = Bodies.rectangle(W+30, H/2, 60, H*2, { isStatic:true, render:{visible:false} });
+Composite.add(world, [floor, leftWall, rightWall]);
+
+// 수면 시각선
+const sea = Bodies.rectangle(W/2, seaY+ (H-seaY)/2, W, H-seaY, {
+  isStatic:true, isSensor:true, render:{fillStyle:'rgba(26,90,120,0.45)'} });
+Composite.add(world, sea);
+
+// ---- 트럭 적재함(오른쪽, 목표 지점) ----
+const binX = W*0.84, binTop = seaY-10, binW = Math.min(180, W*0.22), binH = 110;
+const binWall = (x) => Bodies.rectangle(x, binTop - binH/2, 12, binH, {isStatic:true, render:{fillStyle:'#c7892f'}});
+const binFloor = Bodies.rectangle(binX, binTop, binW, 14, {isStatic:true, render:{fillStyle:'#a9741f'}});
+const binL = binWall(binX - binW/2), binR = binWall(binX + binW/2);
+// 적재함 바닥 센서 → 들어오면 수거 집계
+const binSensor = Bodies.rectangle(binX, binTop - 40, binW-24, 70, {isStatic:true, isSensor:true, render:{visible:false}});
+Composite.add(world, [binFloor, binL, binR, binSensor]);
+
+// ---- 크레인(트롤리 + 로프 + 집게 머리) ----
+const railY = 60;
+let trolley = Bodies.rectangle(W*0.3, railY, 70, 24, {isStatic:true, render:{fillStyle:'#e2e8ec'}});
+let claw = Bodies.circle(W*0.3, railY+160, 16, {
+  density:0.02, frictionAir:0.04, friction:1, restitution:0,
+  render:{fillStyle:'#ffd56b'} });
+let rope = Constraint.create({ bodyA:trolley, bodyB:claw, stiffness:0.12, damping:0.08,
+  length:160, render:{strokeStyle:'#9fb4bf', lineWidth:3} });
+Composite.add(world, [trolley, claw, rope]);
+
+// ---- 쓰레기 종류 ----
+// EPS: 크고 가벼움(쉬움) / 말통: 중간 무게(묵직) / 폐어망: 여러 노드 연결된 흐물흐물(어려움)
+function spawnEPS(x){
+  return Bodies.rectangle(x, seaY-30, 70, 46, {
+    density:0.0006, friction:0.4, frictionAir:0.02, restitution:0.1,
+    label:'EPS', render:{fillStyle:'#f2f4f7'} });
+}
+function spawnDrum(x){
+  return Bodies.circle(x, seaY-30, 28, {
+    density:0.004, friction:0.5, frictionAir:0.01, restitution:0.05,
+    label:'말통', render:{fillStyle:'#4f8bd6'} });
+}
+function spawnNet(x){
+  // 흐물흐물 폐어망: 작은 원 5개를 느슨한 제약으로 연결 → 하나 잡아도 나머지가 끌려오고 잘 빠짐
+  const parts=[]; const n=5; const gap=22;
+  for(let i=0;i<n;i++){
+    parts.push(Bodies.circle(x+i*gap, seaY-30, 11, {
+      density:0.0018, friction:0.6, frictionAir:0.03, restitution:0,
+      label:'폐어망', render:{fillStyle:'#5fae7a'} }));
+  }
+  const comp = Composite.create({label:'netGroup'});
+  Composite.add(comp, parts);
+  for(let i=0;i<n-1;i++){
+    Composite.add(comp, Constraint.create({bodyA:parts[i], bodyB:parts[i+1],
+      stiffness:0.5, damping:0.1, length:gap*0.9, render:{strokeStyle:'#3f7d57', lineWidth:4}}));
+  }
+  return comp;
+}
+function spawnTrash(){
+  const x = W*0.12 + Math.random()*W*0.4;
+  const r = Math.random();
+  if(r<0.4) Composite.add(world, spawnEPS(x));
+  else if(r<0.75) Composite.add(world, spawnDrum(x));
+  else Composite.add(world, spawnNet(x));
+}
+for(let i=0;i<5;i++) spawnTrash();   // 초기 쓰레기
+
+// ---- 집기 메커닉 (방식 B: 집게 끝 근접 + 버튼 → 제약 부착) ----
+// ponytail: 진짜 핀서 마찰그립(방식 A) 대신 근접-제약. 손맛 검증엔 충분, 안 되면 A로 교체.
+let grabbed = null;        // {constraint, body}
+function tryGrab(){
+  if(grabbed){ release(); return; }
+  const tip = claw.position;
+  const candidates = Composite.allBodies(world).filter(b =>
+    !b.isStatic && b!==claw && ['EPS','말통','폐어망'].includes(b.label));
+  let best=null, bestD=42;   // 집게 반경
+  for(const b of candidates){
+    const d = Math.hypot(b.position.x-tip.x, b.position.y-tip.y);
+    if(d<bestD){ bestD=d; best=b; }
+  }
+  if(best){
+    const c = Constraint.create({bodyA:claw, bodyB:best, stiffness:0.9, damping:0.1,
+      length:18, render:{strokeStyle:'#ffd56b', lineWidth:2}});
+    Composite.add(world, c);
+    grabbed = {constraint:c, body:best};
+    document.getElementById('held').textContent = best.label;
+  }
+}
+function release(){
+  if(!grabbed) return;
+  Composite.remove(world, grabbed.constraint);
+  grabbed = null;
+  document.getElementById('held').textContent = '—';
+}
+
+// ---- 수거 집계 ----
+let count=0, score=0;
+const scored = new Set();
+const points = {'EPS':10,'말통':25,'폐어망':40};
+Events.on(engine,'collisionStart',(ev)=>{
+  for(const {bodyA,bodyB} of ev.pairs){
+    const other = bodyA===binSensor?bodyB : bodyB===binSensor?bodyA : null;
+    if(!other || scored.has(other.id)) continue;
+    if(!['EPS','말통','폐어망'].includes(other.label)) continue;
+    scored.add(other.id);
+    count++; score += (points[other.label]||10);
+    document.getElementById('count').textContent = count;
+    document.getElementById('score').textContent = score;
+    if(grabbed && grabbed.body===other) release();   // 적재함에 닿으면 자동 분리
+  }
+});
+
+// ---- 입력 ----
+const keys = {};
+const SPEED = 7;
+addEventListener('keydown', e=>{
+  const k=e.key.toLowerCase();
+  if(k===' '){ e.preventDefault(); tryGrab(); return; }
+  keys[k]=true;
+  if(['arrowleft','arrowright','arrowup','arrowdown',' '].includes(k)) e.preventDefault();
+});
+addEventListener('keyup', e=>{ keys[e.key.toLowerCase()]=false; });
+
+// 터치 버튼
+document.querySelectorAll('#touch button').forEach(btn=>{
+  const k=btn.dataset.k;
+  const on=(e)=>{e.preventDefault(); if(k==='grab')tryGrab(); else if(k==='spawn')spawnTrash(); else keys[k]=true;};
+  const off=(e)=>{e.preventDefault(); keys[k]=false;};
+  btn.addEventListener('touchstart',on); btn.addEventListener('mousedown',on);
+  btn.addEventListener('touchend',off);  btn.addEventListener('mouseup',off); btn.addEventListener('mouseleave',off);
+});
+
+// ---- 매 프레임 트롤리/로프 제어 ----
+Events.on(engine,'beforeUpdate',()=>{
+  let tx = trolley.position.x;
+  if(keys['a']||keys['arrowleft'])  tx -= SPEED;
+  if(keys['d']||keys['arrowright']) tx += SPEED;
+  tx = Math.max(50, Math.min(W-50, tx));
+  Body.setPosition(trolley, {x:tx, y:railY});
+
+  if(keys['w']||keys['arrowup'])   rope.length = Math.max(60,  rope.length-6);
+  if(keys['s']||keys['arrowdown']) rope.length = Math.min(seaY-railY+12, rope.length+6);
+});
+
+// 리셋(R)
+addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='r') location.reload(); });
+</script>
+</body>
+</html>
